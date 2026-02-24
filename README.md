@@ -9,41 +9,43 @@ An MCP server for managing an academic paper library with Claude Code. Search fo
 - **Generate summaries** with section-level detail, key results, tables, and figures
 - **Manage tags** with a growing vocabulary for consistent categorization
 - **Full-text search** over metadata, summaries, and paper content (SQLite FTS5)
-- **Sync across machines** via rclone mount (Wasabi, S3, or any rclone-supported backend)
+- **Sync across machines** via rclone mount (S3, Google Cloud, Backblaze, Dropbox, and [40+ other backends](https://rclone.org/overview/))
 - **Literature reviews** across multiple papers using parallel subagents
 
 ## Installation
 
-### Prerequisites
+### Step 1: Install uv
 
-- **[uv](https://docs.astral.sh/uv/getting-started/installation/)** -- Python package manager used to install and run the server.
+[uv](https://docs.astral.sh/uv/) is a fast Python package manager. If you don't have it:
 
-- **[rclone](https://rclone.org/install/)** (optional) -- A command-line tool for syncing files to cloud storage. Papertrail uses `rclone mount` to make a remote storage bucket (S3, Wasabi, GCS, Backblaze, Dropbox, etc.) appear as a local directory. This means your paper library lives in the cloud and stays in sync across machines automatically. Without rclone, everything works fine locally in `~/.papertrail/`.
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-- **[FUSE-T](https://www.fuse-t.org/) or [macFUSE](https://osxfuse.github.io/)** (macOS only, required if using rclone) -- `rclone mount` needs a FUSE (Filesystem in Userspace) provider to mount remote storage as a local directory. FUSE-T is recommended: it runs in userspace, doesn't require a reboot, and can be installed with `brew install --cask fuse-t`. Linux has FUSE built in, so no extra install is needed there.
-
-### 1. Install the MCP server
-
-Add this to your `~/.claude.json` (global Claude Code config):
-
-```json
-{
-  "mcpServers": {
-    "papertrail": {
-      "command": "uvx",
-      "args": ["--from", "git+https://github.com/YOURUSER/papertrail", "papertrail"],
-      "env": {
-        "PAPERTRAIL_DATA_DIR": "${HOME}/.papertrail",
-        "PAPERTRAIL_RCLONE_REMOTE": ""
-      }
-    }
-  }
-}
+# Or with Homebrew
+brew install uv
 ```
 
-This installs and runs the server automatically via `uvx` -- no cloning required.
+### Step 2: Clone the repo and install skills
 
-For local development, clone the repo and use the directory-based config instead:
+```bash
+git clone https://github.com/YOURUSER/papertrail.git
+cd papertrail
+
+# Copy the skills into your Claude Code config directory.
+# Skills are slash commands (/add-paper, /search-papers, etc.) that
+# tell Claude how to use papertrail step by step.
+mkdir -p ~/.claude/skills
+cp -r skills/* ~/.claude/skills/
+```
+
+### Step 3: Add the MCP server to Claude Code
+
+Claude Code uses MCP (Model Context Protocol) servers to give Claude access
+to external tools. You need to tell Claude Code where to find papertrail.
+
+Open (or create) `~/.claude.json` and add the following. Replace
+`/path/to/papertrail` with the actual path where you cloned the repo:
 
 ```json
 {
@@ -60,42 +62,67 @@ For local development, clone the repo and use the directory-based config instead
 }
 ```
 
-### 2. Install the skills
+Restart Claude Code (or run `/mcp` to reload servers). You should see
+papertrail's tools become available.
 
-Clone the repo and copy the skills into your Claude Code config:
+At this point you're done -- papertrail will store everything locally in
+`~/.papertrail/`. If you want to sync across machines, continue to step 4.
+
+### Step 4: Set up cloud sync with rclone (optional)
+
+[rclone](https://rclone.org/) lets you mount cloud storage (S3, Wasabi, Google
+Cloud, Backblaze, Dropbox, etc.) as a local folder. When configured, papertrail
+reads and writes directly to the mount, so your library stays in sync across
+machines automatically.
+
+#### 4a. Install rclone
 
 ```bash
-git clone https://github.com/YOURUSER/papertrail.git
-cp -r papertrail/skills/* ~/.claude/skills/
+# macOS
+brew install rclone
+
+# Linux
+sudo apt install rclone   # Debian/Ubuntu
+# Or: curl https://rclone.org/install.sh | sudo bash
 ```
 
-This makes the skills available globally as slash commands.
+#### 4b. Install a FUSE provider (macOS only)
 
-### 3. Configure rclone (optional)
-
-To sync your library across machines using an rclone mount:
+`rclone mount` needs FUSE (Filesystem in Userspace) to make remote storage
+appear as a local directory. Linux has this built in. On macOS, install one of:
 
 ```bash
-# 1. Install a FUSE provider (macOS only)
-brew install --cask fuse-t    # lightweight, no reboot needed
-# OR: brew install --cask macfuse
+# FUSE-T (recommended -- lightweight, no reboot needed)
+brew install --cask fuse-t
 
-# 2. Configure an rclone remote (S3, Wasabi, GCS, Backblaze, Dropbox, etc.)
+# OR macFUSE (more mature, but requires a reboot after install)
+brew install --cask macfuse
+```
+
+#### 4c. Configure a remote
+
+Run `rclone config` and follow the interactive prompts to connect your storage
+provider. This creates a named remote you'll reference later. See
+[rclone's provider list](https://rclone.org/overview/) for setup guides for
+each backend.
+
+```bash
 rclone config
-# Follow the interactive prompts to set up your chosen storage provider.
-# This creates a named remote (e.g., "myremote") you can reference later.
-# See https://rclone.org/overview/ for the full list of supported backends.
-
-# 3. Create your bucket/directory on the remote
-rclone mkdir myremote:my-bucket
-
-# 4. Set PAPERTRAIL_RCLONE_REMOTE in your MCP config:
-# "PAPERTRAIL_RCLONE_REMOTE": "myremote:my-bucket"
+# Example: create a remote named "myremote" pointing to an S3-compatible bucket
 ```
 
-When `PAPERTRAIL_RCLONE_REMOTE` is set, the server automatically mounts the remote at `~/.papertrail` on startup and unmounts on shutdown. All file writes go directly to the mount, so changes are synced automatically.
+#### 4d. Create your bucket and update the config
 
-Without rclone configured, everything works locally in `~/.papertrail/`.
+```bash
+# Create the bucket on your remote
+rclone mkdir myremote:my-papertrail-bucket
+
+# Then update PAPERTRAIL_RCLONE_REMOTE in your ~/.claude.json:
+# "PAPERTRAIL_RCLONE_REMOTE": "myremote:my-papertrail-bucket"
+```
+
+Restart Claude Code. On startup, papertrail will automatically mount the remote
+at `~/.papertrail` and unmount it on shutdown.
 
 ## Usage
 
@@ -154,28 +181,3 @@ Runs the full pipeline: find, download, convert to markdown, generate a structur
 - **Off VPN**: Set `PAPERTRAIL_HTTP_PROXY` to your institution's proxy URL to route PDF downloads through it.
 - **Unpaywall**: Set `PAPERTRAIL_UNPAYWALL_EMAIL` to any email address to enable the Unpaywall API, which finds legal open access copies of papers. No API key needed.
 
-## Architecture
-
-```
-~/.papertrail/                     # rclone mount (or local dir)
-  tags.json                        # Global tag vocabulary
-  papers/{bibtex_key}/
-    metadata.json                  # Source of truth for all paper data
-    paper.pdf                      # Original PDF
-    paper.md                       # Markdown conversion
-    summary.json                   # Convenience copy of summary
-
-~/.cache/papertrail/
-  index.db                         # Ephemeral SQLite FTS5 index
-```
-
-JSON files on the mount are the source of truth. The SQLite index is ephemeral and rebuilt on every server startup (fast metadata scan, then background fulltext indexing). The write pattern is: write JSON first, then update the index.
-
-## Development
-
-```bash
-git clone https://github.com/YOURUSER/papertrail.git
-cd papertrail
-uv sync --extra dev
-uv run pytest
-```
