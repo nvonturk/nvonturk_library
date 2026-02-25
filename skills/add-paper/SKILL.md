@@ -58,6 +58,11 @@ the bibtex key):
 > Read the paper with bibtex key "{bibtex_key}" using the `read_paper` MCP tool
 > and generate a structured summary.
 >
+> **IMPORTANT**: Only summarize content that appears in the paper text returned by
+> `read_paper`. Do not supplement with outside knowledge. If a section is missing
+> or illegible, say so rather than filling in from memory. Every claim in the
+> summary must be traceable to the text you read.
+>
 > 1. Call `read_paper` with `bibtex_key`, `start_line=1`, `end_line=500` to get the
 >    first chunk and the total line count (shown in the response header).
 > 2. If the paper has more than 500 lines, call `read_paper` for all remaining chunks

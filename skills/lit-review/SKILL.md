@@ -31,6 +31,11 @@ Each subagent prompt should be (fill in bibtex_key and the research question):
 > Read the paper with bibtex key "{bibtex_key}" using the `read_paper` MCP tool
 > and extract information relevant to this research question: "{question}"
 >
+> **IMPORTANT**: Only report findings, methods, and claims that appear in the
+> paper text returned by `read_paper`. Do not supplement with outside knowledge
+> about this paper or its authors. If a section is missing or illegible, say so.
+> Every claim must be traceable to specific text you read.
+>
 > 1. Call `read_paper` with `bibtex_key`, `start_line=1`, `end_line=500` to get
 >    the first chunk and total line count.
 > 2. If the paper has more than 500 lines, call `read_paper` for all remaining

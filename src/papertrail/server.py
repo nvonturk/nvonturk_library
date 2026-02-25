@@ -515,6 +515,8 @@ async def store_summary(
     """Store a summary for a paper and set its status to 'ready'.
 
     Call this after reading a paper's markdown and generating a structured summary.
+    The summary must only contain information from the paper's actual text.
+    Do not include claims from outside knowledge.
 
     Args:
         bibtex_key: The paper's BibTeX key
