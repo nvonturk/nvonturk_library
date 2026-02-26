@@ -56,29 +56,57 @@ Use the Task tool to launch a `general-purpose` subagent with this prompt (fill 
 the bibtex key):
 
 > Read the paper with bibtex key "{bibtex_key}" using the `read_paper` MCP tool
-> and generate a structured summary.
+> and generate a structured summary. Also call `get_paper_metadata` to retrieve
+> the paper's title, authors, and abstract.
 >
-> **IMPORTANT**: Only summarize content that appears in the paper text returned by
-> `read_paper`. Do not supplement with outside knowledge. If a section is missing
-> or illegible, say so rather than filling in from memory. Every claim in the
-> summary must be traceable to the text you read.
+> ## Step 1: Read the full paper
 >
 > 1. Call `read_paper` with `bibtex_key`, `start_line=1`, `end_line=500` to get the
 >    first chunk and the total line count (shown in the response header).
 > 2. If the paper has more than 500 lines, call `read_paper` for all remaining chunks
 >    **in parallel** (e.g., 501-1000, 1001-1500, etc., using 500-line chunks).
 > 3. Combine all chunks in order to form the full paper text.
-> 4. Generate a JSON summary with these keys:
->    - `main_contribution`: 2-3 sentences on the paper's primary contribution
->    - `methodology`: Description of the methods used
->    - `findings`: Key results and findings
+>
+> ## Step 2: Verify the document matches the metadata
+>
+> Before summarizing, check that the document you read is actually the right paper:
+> - Does the title in the text match the metadata title?
+> - Do the authors match?
+> - Is this the full paper, or is it an errata, corrigendum, table of contents,
+>   or other supplementary material?
+>
+> If the document does NOT match the metadata, or is not the full paper, DO NOT
+> generate a summary. Instead return:
+>   WRONG_DOCUMENT: A brief explanation of what the document actually is
+>   (e.g., "This is an errata for the paper, not the paper itself" or
+>   "This PDF is a copy of a different paper by the same author")
+>
+> ## Step 3: Generate the summary
+>
+> **IMPORTANT**: Only summarize content that appears in the paper text returned by
+> `read_paper`. Do not supplement with outside knowledge. If a section is missing
+> or illegible, say so rather than filling in from memory.
+>
+> For every specific factual claim (numbers, percentages, coefficients, named
+> results), include a line reference in parentheses, e.g., "(lines 340-342)".
+> This is required so claims can be verified against the source text. If you
+> cannot find a line number for a claim, do not include the claim.
+>
+> Generate a JSON summary with these keys:
+>    - `main_contribution`: 2-3 sentences on the paper's primary contribution,
+>      with line references for key claims
+>    - `methodology`: Description of the methods used, with line references
+>    - `findings`: Key results and findings, each with line references for
+>      specific numbers or results
 >    - `limitations`: Noted limitations or caveats
 >    - `section_summaries`: Object mapping section headers to 1-2 sentence summaries
 >    - `key_tables`: Array of objects with `table` and `description` for important tables
 >    - `key_figures`: Array of objects with `figure` and `description` for important figures
-> 5. Generate 3-8 descriptive keywords for the paper.
-> 6. Return ONLY the JSON summary string and the keywords list, nothing else.
->    Format your response as:
+>
+> Generate 3-8 descriptive keywords for the paper.
+>
+> Return ONLY the JSON summary string and the keywords list, nothing else.
+> Format your response as:
 >    SUMMARY_JSON: ```json\n{...}\n```
 >    KEYWORDS: keyword1, keyword2, keyword3, ...
 
@@ -86,7 +114,14 @@ the bibtex key):
 
 While the subagent is running, call `list_tags` to retrieve the current tag vocabulary.
 
-## Step 5: Assign tags and store summary (in parallel)
+## Step 5: Handle wrong document
+
+If the subagent returned `WRONG_DOCUMENT`, report the issue to the user:
+- What document was actually ingested (e.g., errata, different paper)
+- The bibtex key so they can delete it or provide the correct PDF
+- Stop here. Do not store a summary or assign tags.
+
+## Step 6: Assign tags and store summary (in parallel)
 
 Once the subagent returns the summary and keywords, and you have the tag vocabulary:
 
@@ -97,7 +132,7 @@ Once the subagent returns the summary and keywords, and you have the tag vocabul
    - `tag_paper` with the bibtex key and chosen tags
    - `store_summary` with the bibtex key, the JSON summary string, and the keywords list
 
-## Step 6: Report
+## Step 7: Report
 
 Provide a brief report to the user:
 - Paper title and bibtex key
