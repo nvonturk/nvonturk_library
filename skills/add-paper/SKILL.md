@@ -10,14 +10,14 @@ You are adding a paper to the papertrail library. The user provided: $ARGUMENTS
 
 Follow these steps in order.
 
-## Step 1: Find and ingest the paper
+## Step 1: Find and ingest metadata
 
 If the argument is a **local file path** (ends in .pdf, or starts with / or ~/):
 1. Extract the paper title from the filename (strip author prefixes, underscores, extensions)
 2. Call `find_paper` with the title to find the paper's DOI or arXiv ID
-3. Call `ingest_paper` with the identifier
-4. If the PDF download fails, call `ingest_paper_manual` with the bibtex key and
-   `pdf_source_path` set to the absolute path of the local file
+3. Call `ingest_paper` with the identifier (saves metadata only)
+4. Then call `download_paper` with the bibtex key and `pdf_source_path` set to the
+   absolute path of the local file
 
 If the argument looks like a DOI (contains "10."), arXiv ID (like "2301.12345"),
 SSRN URL/ID, or other URL, call `ingest_paper` directly with that identifier.
@@ -28,20 +28,45 @@ Pick the best match and call `ingest_paper` with its DOI or arXiv ID.
 If `find_paper` returns no results, use web search to find the paper, then try
 `ingest_paper` with a DOI or URL from the search results.
 
-## Step 2: Handle download failures
+## Step 2: Download the PDF
 
-If `ingest_paper` reports that the PDF download failed (status "pending_pdf"):
+After `ingest_paper` returns the bibtex key, **skip this step if the user provided
+a local file path** (the PDF was already provided in Step 1).
 
-1. If the user provided a local PDF path, call `ingest_paper_manual` with the bibtex key
-   and `pdf_source_path` set to the local path
-2. Check if the paper has an arXiv version -- if so, try `ingest_paper` again with the arXiv ID
-3. Ask the user to download the PDF manually and tell them the path to place it at
-4. Once the PDF is placed, call `ingest_paper_manual` with the bibtex key to continue
+Otherwise, launch two tasks **in parallel**:
+
+### Task A: Automated download
+
+Call `download_paper` with the bibtex key (no pdf_url or pdf_source_path). This runs
+the full automated pipeline (arXiv, NBER, Unpaywall, institutional repos, etc.).
+
+### Task B: Web search for PDF
+
+Use WebSearch to find a freely available PDF. Try these queries:
+1. "{paper title}" filetype:pdf
+2. "{first author last name}" "{first few title words}" PDF
+
+For each search, scan the results for:
+- Direct PDF links (ending in .pdf or from known repositories)
+- Author faculty/personal websites (these often host working paper PDFs)
+- Institutional repositories (repec.org, nber.org, econstor.eu, etc.)
+
+Collect up to 3 promising PDF URLs.
+
+### After both tasks complete:
+
+- If Task A succeeded (status is "converting"), you're done with the PDF step.
+- If Task A failed, try each URL from Task B by calling `download_paper` with the
+  bibtex key and `pdf_url` set to the URL. Stop as soon as one succeeds.
+- If all URLs fail, ask the user to download the PDF manually and tell them
+  the path to place it at (`~/.papertrail/papers/{bibtex_key}/paper.pdf`).
+- Once the user places the PDF, call `download_paper` with the bibtex key and
+  `pdf_source_path` to continue.
 
 ## Step 3: Wait for conversion
 
-After ingesting (or after calling `ingest_paper_manual`), poll `conversion_status`
-with the bibtex key every 10 seconds until the status is "summarizing" (or "error").
+After the PDF is registered, poll `conversion_status` with the bibtex key every
+10 seconds until the status is "summarizing" (or "error").
 Do not poll more than 30 times.
 
 If status is "error", report the error and stop.

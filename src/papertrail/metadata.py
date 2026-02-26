@@ -33,6 +33,7 @@ DOI_PATTERN = re.compile(r"^10\.\d{4,}")
 
 UNPAYWALL_BASE = "https://api.unpaywall.org/v2"
 CROSSREF_BASE = "https://api.crossref.org/works"
+OPENALEX_BASE = "https://api.openalex.org/works"
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -314,80 +315,100 @@ class MetadataFetcher:
         """Build an ordered list of candidate PDF download URLs for a paper."""
         urls = []
 
-        if result.open_access_pdf_url:
-            urls.append(result.open_access_pdf_url)
-
         if result.arxiv_id:
             clean_id = result.arxiv_id.split("v")[0] if "v" in result.arxiv_id else result.arxiv_id
             urls.append(f"https://arxiv.org/pdf/{clean_id}")
 
-        # NBER working papers (economics)
         nber_url = self._get_nber_pdf_url(result)
         if nber_url:
             urls.append(nber_url)
 
-        if result.ssrn_id:
-            urls.append(f"https://papers.ssrn.com/sol3/Delivery.cfm?abstractid={result.ssrn_id}")
-
-        if result.doi:
-            urls.append(f"https://doi.org/{result.doi}")
-
         if result.url and result.url not in urls:
             urls.append(result.url)
 
+        if result.open_access_pdf_url and result.open_access_pdf_url not in urls:
+            urls.append(result.open_access_pdf_url)
+
+        doi_url = f"https://doi.org/{result.doi}" if result.doi else None
+        if doi_url and doi_url not in urls:
+            urls.append(doi_url)
+
+        if result.ssrn_id:
+            urls.append(f"https://papers.ssrn.com/sol3/Delivery.cfm?abstractid={result.ssrn_id}")
+
         return urls
 
-    async def download_pdf(self, result: SearchResult, dest_path: Path) -> DownloadResult:
+    async def download_pdf(
+        self, result: SearchResult, dest_path: Path, verify: bool = True
+    ) -> DownloadResult:
         """Download the PDF for a paper, trying multiple sources.
 
         Returns a DownloadResult with success status, path, and details of each attempt.
         The caller can use candidate_urls for manual/browser-based fallback.
 
+        When verify=True, downloaded PDFs are checked against expected title/authors
+        to reject wrong papers, errata, or paywall landing pages saved as PDF.
+
         Order of attempts:
-        1. Open access PDF URL (from Semantic Scholar)
-        2. arXiv PDF
-        3. NBER working paper PDF
-        4. SSRN direct download
-        5. Unpaywall (finds legal open access copies)
-        6. PubMed Central
-        7. DOI redirect (works through institutional VPN/proxy)
-        8. Direct URL
+        1. arXiv PDF
+        2. NBER working paper PDF
+        3. Direct URL
+        4. Open access PDF URL (from Semantic Scholar)
+        5. PubMed Central
+        6. OpenAlex (institutional repositories, preprint servers)
+        7. Unpaywall (finds legal open access copies)
+        8. DOI redirect (works through institutional VPN/proxy)
+        9. SSRN direct download (often Cloudflare-blocked)
         """
+        from papertrail.converter import verify_pdf_content
+
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         urls_to_try = []
 
-        if result.open_access_pdf_url:
-            urls_to_try.append(result.open_access_pdf_url)
-
+        # 1. arXiv — fast, reliable, no paywall
         if result.arxiv_id:
             clean_id = result.arxiv_id.split("v")[0] if "v" in result.arxiv_id else result.arxiv_id
             urls_to_try.append(f"https://arxiv.org/pdf/{clean_id}")
 
+        # 2. NBER working papers
         nber_url = self._get_nber_pdf_url(result)
         if nber_url:
             urls_to_try.append(nber_url)
 
-        if result.ssrn_id:
-            urls_to_try.append(f"https://papers.ssrn.com/sol3/Delivery.cfm?abstractid={result.ssrn_id}")
+        # 3. Direct URL (e.g., author website, conference proceedings)
+        if result.url and result.url not in urls_to_try:
+            urls_to_try.append(result.url)
 
-        # Unpaywall
-        if result.doi:
-            unpaywall_url = await self._get_unpaywall_pdf_url(result.doi)
-            if unpaywall_url:
-                urls_to_try.append(unpaywall_url)
+        # 4. Semantic Scholar open access PDF
+        if result.open_access_pdf_url and result.open_access_pdf_url not in urls_to_try:
+            urls_to_try.append(result.open_access_pdf_url)
 
-        # PubMed Central
+        # 5. PubMed Central
         if result.doi:
             pmc_url = await self._get_pmc_pdf_url(result.doi)
             if pmc_url:
                 urls_to_try.append(pmc_url)
 
-        # DOI redirect — works through institutional VPN/proxy
+        # 6. OpenAlex (institutional repositories, preprint servers)
+        if result.doi:
+            openalex_urls = await self._get_openalex_pdf_urls(result.doi)
+            for oa_url in openalex_urls:
+                if oa_url not in urls_to_try:
+                    urls_to_try.append(oa_url)
+
+        # 7. Unpaywall
+        if result.doi:
+            unpaywall_url = await self._get_unpaywall_pdf_url(result.doi)
+            if unpaywall_url and unpaywall_url not in urls_to_try:
+                urls_to_try.append(unpaywall_url)
+
+        # 8. DOI redirect — works through institutional VPN/proxy
         if result.doi:
             urls_to_try.append(f"https://doi.org/{result.doi}")
 
-        if result.url and result.url not in urls_to_try:
-            urls_to_try.append(result.url)
+        # 9. SSRN — last because frequently Cloudflare-blocked
+        if result.ssrn_id:
+            urls_to_try.append(f"https://papers.ssrn.com/sol3/Delivery.cfm?abstractid={result.ssrn_id}")
 
         download_result = DownloadResult(
             success=False,
@@ -411,6 +432,17 @@ class MetadataFetcher:
                     "pdf" in attempt.content_type or response.content[:5] == b"%PDF-"
                 ):
                     dest_path.write_bytes(response.content)
+
+                    if verify and result.title:
+                        verification = await asyncio.to_thread(
+                            verify_pdf_content, dest_path, result.title, result.authors
+                        )
+                        if not verification["verified"]:
+                            attempt.error = f"Content mismatch: {verification['reason']}"
+                            dest_path.unlink(missing_ok=True)
+                            download_result.attempts.append(attempt)
+                            continue
+
                     download_result.success = True
                     download_result.pdf_path = dest_path
                     download_result.attempts.append(attempt)
@@ -472,6 +504,33 @@ class MetadataFetcher:
             return None
         except (httpx.HTTPError, KeyError):
             return None
+
+    async def _get_openalex_pdf_urls(self, doi: str) -> list[str]:
+        """Query OpenAlex for PDF URLs from institutional repositories and publishers."""
+        params = {}
+        if self.unpaywall_email:
+            params["mailto"] = self.unpaywall_email
+        try:
+            response = await self.client.get(
+                f"{OPENALEX_BASE}/https://doi.org/{doi}",
+                params=params,
+            )
+            if response.status_code != 200:
+                return []
+            data = response.json()
+            pdf_urls = []
+            oa_info = data.get("open_access", {})
+            oa_url = oa_info.get("oa_url")
+            if oa_url:
+                pdf_urls.append(oa_url)
+            for location in data.get("locations", []):
+                pdf_url = location.get("pdf_url")
+                if pdf_url and pdf_url not in pdf_urls:
+                    pdf_urls.append(pdf_url)
+            return pdf_urls
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            logger.debug("OpenAlex lookup failed for %s: %s", doi, exc)
+            return []
 
     async def _get_unpaywall_pdf_url(self, doi: str) -> str | None:
         """Query Unpaywall for an open access PDF URL."""

@@ -17,6 +17,20 @@ class SearchResult(BaseModel):
     open_access_pdf_url: str | None = None
     source: str = "semantic_scholar"
 
+    @classmethod
+    def from_metadata(cls, paper: "PaperMetadata") -> "SearchResult":
+        """Reconstruct a SearchResult from stored PaperMetadata."""
+        return cls(
+            title=paper.title,
+            authors=paper.authors,
+            year=paper.year,
+            abstract=paper.abstract,
+            doi=paper.doi,
+            arxiv_id=paper.arxiv_id,
+            ssrn_id=paper.ssrn_id,
+            url=paper.url,
+        )
+
 
 class PaperMetadata(BaseModel):
     """Full metadata for a paper stored in the library."""

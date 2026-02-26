@@ -13,7 +13,7 @@ from papertrail.config import PapertrailConfig
 from papertrail.converter import PdfConverter
 from papertrail.database import PaperDatabase
 from papertrail.metadata import MetadataFetcher
-from papertrail.models import PaperMetadata
+from papertrail.models import PaperMetadata, SearchResult
 from papertrail.sync import sync_pull, sync_pull_if_stale, sync_push, sync_delete
 from papertrail.paper_store import PaperStore
 
@@ -181,12 +181,11 @@ async def find_paper(query: str, limit: int = 10, ctx: Context = None) -> str:
 
 @mcp.tool()
 async def ingest_paper(identifier: str, ctx: Context = None) -> str:
-    """Download a paper and start converting it to markdown.
+    """Fetch metadata for a paper and save it to the library.
 
-    Accepts a DOI, arXiv ID, SSRN ID/URL, or paper URL. Downloads the PDF,
-    fetches metadata, generates a BibTeX key, and starts background conversion.
-
-    Use conversion_status to check progress after calling this.
+    Accepts a DOI, arXiv ID, SSRN ID/URL, or paper URL. Saves metadata and
+    generates a BibTeX key. Does NOT download the PDF — call download_paper
+    separately to fetch or provide the PDF.
 
     Args:
         identifier: DOI (e.g., "10.1257/aer.2024.001"), arXiv ID (e.g., "2301.12345"),
@@ -197,7 +196,6 @@ async def ingest_paper(identifier: str, ctx: Context = None) -> str:
     db: PaperDatabase = lc["db"]
     config: PapertrailConfig = lc["config"]
     fetcher: MetadataFetcher = lc["fetcher"]
-    converter: PdfConverter = lc["converter"]
     store: PaperStore = lc["store"]
 
     # 1. Look up metadata
@@ -221,12 +219,7 @@ async def ingest_paper(identifier: str, ctx: Context = None) -> str:
     paper_dir = config.papers_dir / bibtex_key
     paper_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Download PDF (before writing metadata)
-    pdf_path = paper_dir / "paper.pdf"
-    dl = await fetcher.download_pdf(result, pdf_path)
-
-    # 4. Create paper metadata with correct initial status
-    initial_status = "converting" if dl.success else "pending_pdf"
+    # 3. Create paper metadata
     paper = PaperMetadata(
         bibtex_key=bibtex_key,
         title=result.title,
@@ -241,60 +234,21 @@ async def ingest_paper(identifier: str, ctx: Context = None) -> str:
         fields_of_study=result.fields_of_study,
         citation_count=result.citation_count,
         added_date=datetime.now(UTC).isoformat(),
-        status=initial_status,
+        status="pending_pdf",
     )
 
-    # 5. Write JSON source of truth, then update index
+    # 4. Write JSON source of truth, then update index
     await asyncio.to_thread(store.write_paper_metadata, paper)
     await db.upsert_paper(paper)
     await _push_paper(lc, bibtex_key)
 
-    if not dl.success:
-        failure_details = []
-        for attempt in dl.attempts:
-            detail = f"  - {attempt.url}: "
-            if attempt.cloudflare_blocked:
-                detail += "blocked by Cloudflare"
-            elif attempt.error:
-                detail += attempt.error
-            else:
-                detail += f"status={attempt.status_code}"
-            failure_details.append(detail)
-        details_text = "\n".join(failure_details) if failure_details else "  No URLs to try"
-        return (
-            f"Ingested metadata for **{bibtex_key}** but PDF download failed.\n\n"
-            f"**Attempts:**\n{details_text}\n\n"
-            f"To add the PDF manually, download it and place it at:\n"
-            f"  `{pdf_path}`\n\n"
-            f"Then call `ingest_paper_manual(\"{bibtex_key}\")` to continue processing."
-        )
-
-    # 6. Start background conversion
-    md_path = paper_dir / "paper.md"
-
-    async def background_convert():
-        try:
-            content = await converter.convert(pdf_path, md_path)
-            await db.index_fulltext(bibtex_key, content)
-            paper.status = "summarizing"
-            await asyncio.to_thread(store.write_paper_metadata, paper)
-            await db.update_status(bibtex_key, "summarizing")
-        except Exception:
-            logger.error("Background conversion failed for %s", bibtex_key, exc_info=True)
-            paper.status = "error"
-            await asyncio.to_thread(store.write_paper_metadata, paper)
-            await db.update_status(bibtex_key, "error")
-        await _push_paper(lc, bibtex_key)
-
-    asyncio.create_task(background_convert())
-
     return (
-        f"Paper ingested as **{bibtex_key}**\n\n"
+        f"Paper metadata saved as **{bibtex_key}**\n\n"
         f"- Title: {result.title}\n"
         f"- Authors: {', '.join(result.authors)}\n"
-        f"- Year: {result.year}\n\n"
-        f"PDF is being converted to markdown in the background. "
-        f"Use `conversion_status(\"{bibtex_key}\")` to check progress."
+        f"- Year: {result.year}\n"
+        f"- Status: pending_pdf\n\n"
+        f"Call `download_paper(\"{bibtex_key}\")` to download the PDF."
     )
 
 
@@ -312,7 +266,7 @@ async def conversion_status(bibtex_key: str, ctx: Context = None) -> str:
         return f"No paper found with key: {bibtex_key}"
     status_desc = {
         "downloading": "PDF is being downloaded",
-        "pending_pdf": "Metadata saved but PDF download failed. Place PDF manually and call ingest_paper_manual.",
+        "pending_pdf": "Metadata saved, waiting for PDF. Call download_paper to fetch or provide the PDF.",
         "converting": "PDF is being converted to markdown (this may take a minute)",
         "summarizing": "Conversion complete. Ready for summary generation.",
         "ready": "Fully processed with summary",
@@ -323,21 +277,24 @@ async def conversion_status(bibtex_key: str, ctx: Context = None) -> str:
 
 
 @mcp.tool()
-async def ingest_paper_manual(
+async def download_paper(
     bibtex_key: str,
     pdf_url: str | None = None,
     pdf_source_path: str | None = None,
     ctx: Context = None,
 ) -> str:
-    """Provide a PDF for a paper that failed automatic download.
+    """Download or provide a PDF for a paper in the library.
 
-    The paper must already exist in the library (from a prior ingest_paper call).
-    Provide either a direct PDF URL to download from, a local file path, or
-    place the PDF at ~/.papertrail/papers/{bibtex_key}/paper.pdf beforehand.
+    The paper must already exist (from a prior ingest_paper call). Three modes:
+    - pdf_url: Download from a specific URL
+    - pdf_source_path: Copy from a local file
+    - Neither: Run the full automated download pipeline (arXiv, NBER, Unpaywall, etc.)
+
+    On success, starts background conversion to markdown.
 
     Args:
         bibtex_key: The paper's BibTeX key
-        pdf_url: Optional URL to download the PDF from (e.g., NBER working paper URL)
+        pdf_url: Optional URL to download the PDF from
         pdf_source_path: Optional absolute path to a local PDF file
     """
     lc = _get_context(ctx)
@@ -378,11 +335,39 @@ async def ingest_paper_manual(
         if not source.exists():
             return f"Source PDF not found at: {pdf_source_path}"
         shutil.copy2(source, pdf_path)
+    else:
+        # Automated pipeline: reconstruct SearchResult and try all sources
+        search_result = SearchResult.from_metadata(paper)
+        dl = await fetcher.download_pdf(search_result, pdf_path)
+        if not dl.success:
+            failure_details = []
+            for attempt in dl.attempts:
+                detail = f"  - {attempt.url}: "
+                if attempt.cloudflare_blocked:
+                    detail += "blocked by Cloudflare"
+                elif attempt.error:
+                    detail += attempt.error
+                else:
+                    detail += f"status={attempt.status_code}"
+                failure_details.append(detail)
+            details_text = "\n".join(failure_details) if failure_details else "  No URLs to try"
+            candidate_text = ""
+            if dl.candidate_urls:
+                candidate_text = "\n**Candidate URLs:**\n" + "\n".join(
+                    f"  - {u}" for u in dl.candidate_urls
+                )
+            return (
+                f"Automated PDF download failed for **{bibtex_key}**.\n\n"
+                f"**Attempts:**\n{details_text}\n"
+                f"{candidate_text}\n\n"
+                f"Try `download_paper(\"{bibtex_key}\", pdf_url=...)` with a direct PDF URL,\n"
+                f"or `download_paper(\"{bibtex_key}\", pdf_source_path=...)` with a local file."
+            )
 
     if not pdf_path.exists():
         return (
             f"No PDF found at `{pdf_path}`.\n"
-            f"Provide a pdf_url, pdf_source_path, or place the PDF there manually."
+            f"Provide a pdf_url, pdf_source_path, or omit both to try automated download."
         )
 
     # Start conversion

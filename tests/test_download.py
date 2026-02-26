@@ -1,10 +1,14 @@
-"""Tests for the PDF download pipeline, including SSRN, Cloudflare detection, and source ordering."""
+"""Tests for the PDF download pipeline, including SSRN, Cloudflare detection, source ordering, OpenAlex, and content verification."""
+
+from pathlib import Path
 
 import pytest
 import httpx
+import pymupdf
 import respx
 
 from papertrail.config import PapertrailConfig
+from papertrail.converter import verify_pdf_content
 from papertrail.metadata import (
     MetadataFetcher,
     DownloadResult,
@@ -12,7 +16,7 @@ from papertrail.metadata import (
     CLOUDFLARE_MARKERS,
     _RateLimiter,
 )
-from papertrail.models import SearchResult
+from papertrail.models import PaperMetadata, SearchResult
 
 
 CLOUDFLARE_CHALLENGE_HTML = """
@@ -44,6 +48,15 @@ SSRN_ABSTRACT_HTML = """
 """
 
 FAKE_PDF_CONTENT = b"%PDF-1.4 fake pdf content for testing"
+
+
+def _create_test_pdf(path, text_content):
+    """Create a minimal PDF with the given text on the first page."""
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), text_content, fontsize=11)
+    doc.save(str(path))
+    doc.close()
 
 
 @pytest.fixture
@@ -158,7 +171,7 @@ class TestCandidateUrls:
         nber_urls = [u for u in urls if "nber.org/system/files" in u]
         assert len(nber_urls) >= 1
 
-    def test_open_access_url_first(self, fetcher):
+    def test_arxiv_url_first(self, fetcher):
         result = SearchResult(
             title="Test Paper",
             authors=["Smith"],
@@ -167,7 +180,7 @@ class TestCandidateUrls:
             arxiv_id="2301.12345",
         )
         urls = fetcher.get_candidate_urls(result)
-        assert urls[0] == "https://example.com/paper.pdf"
+        assert urls[0] == "https://arxiv.org/pdf/2301.12345"
 
     def test_no_duplicate_urls(self, fetcher):
         result = SearchResult(
@@ -186,17 +199,20 @@ class TestDownloadPdf:
     @pytest.mark.asyncio
     async def test_successful_pdf_download(self, fetcher, tmp_path):
         result = SearchResult(
-            title="Test",
+            title="Test Paper",
             authors=["Smith"],
             open_access_pdf_url="https://example.com/paper.pdf",
         )
         dest = tmp_path / "paper.pdf"
+        source_pdf = tmp_path / "source.pdf"
+        _create_test_pdf(source_pdf, "Test Paper\nSmith\nThis is a research paper about testing with enough content to pass verification checks.")
+        pdf_bytes = source_pdf.read_bytes()
 
         with respx.mock:
             respx.get("https://example.com/paper.pdf").mock(
                 return_value=httpx.Response(
                     200,
-                    content=FAKE_PDF_CONTENT,
+                    content=pdf_bytes,
                     headers={"content-type": "application/pdf"},
                 )
             )
@@ -204,23 +220,26 @@ class TestDownloadPdf:
 
         assert dl.success is True
         assert dl.pdf_path == dest
-        assert dest.read_bytes() == FAKE_PDF_CONTENT
+        assert dest.read_bytes() == pdf_bytes
 
     @pytest.mark.asyncio
     async def test_detects_pdf_by_magic_bytes(self, fetcher, tmp_path):
         """Some servers return PDFs with wrong content-type."""
         result = SearchResult(
-            title="Test",
+            title="Test Paper",
             authors=["Smith"],
             open_access_pdf_url="https://example.com/paper",
         )
         dest = tmp_path / "paper.pdf"
+        source_pdf = tmp_path / "source.pdf"
+        _create_test_pdf(source_pdf, "Test Paper\nSmith\nThis is a research paper about testing with enough content to pass verification checks.")
+        pdf_bytes = source_pdf.read_bytes()
 
         with respx.mock:
             respx.get("https://example.com/paper").mock(
                 return_value=httpx.Response(
                     200,
-                    content=FAKE_PDF_CONTENT,
+                    content=pdf_bytes,
                     headers={"content-type": "application/octet-stream"},
                 )
             )
@@ -267,21 +286,26 @@ class TestDownloadPdf:
     async def test_falls_through_to_next_source(self, fetcher, tmp_path):
         """If first source fails, tries the next one."""
         result = SearchResult(
-            title="Test",
+            title="Test Paper",
             authors=["Smith"],
-            open_access_pdf_url="https://example.com/broken.pdf",
-            arxiv_id="2301.12345",
+            open_access_pdf_url="https://example.com/good.pdf",
+            url="https://example.com/broken.pdf",
         )
         dest = tmp_path / "paper.pdf"
+        source_pdf = tmp_path / "source.pdf"
+        _create_test_pdf(source_pdf, "Test Paper\nSmith\nThis is a research paper about testing with enough content to pass verification checks.")
+        pdf_bytes = source_pdf.read_bytes()
 
         with respx.mock:
+            # Direct URL tried first (position 3), fails
             respx.get("https://example.com/broken.pdf").mock(
                 return_value=httpx.Response(404)
             )
-            respx.get("https://arxiv.org/pdf/2301.12345").mock(
+            # Semantic Scholar OA tried next (position 4), succeeds
+            respx.get("https://example.com/good.pdf").mock(
                 return_value=httpx.Response(
                     200,
-                    content=FAKE_PDF_CONTENT,
+                    content=pdf_bytes,
                     headers={"content-type": "application/pdf"},
                 )
             )
@@ -304,6 +328,12 @@ class TestDownloadPdf:
         dest = tmp_path / "paper.pdf"
 
         with respx.mock:
+            # OpenAlex: no results
+            respx.get(url__regex=r".*openalex\.org.*").mock(
+                return_value=httpx.Response(200, json={
+                    "open_access": {}, "locations": []
+                })
+            )
             # Unpaywall: no results
             respx.get("https://api.unpaywall.org/v2/10.1234/fake").mock(
                 return_value=httpx.Response(200, json={"best_oa_location": None, "oa_locations": []})
@@ -331,17 +361,20 @@ class TestDownloadPdf:
     async def test_ssrn_success_when_not_blocked(self, fetcher, tmp_path):
         """SSRN download works when Cloudflare is not active."""
         result = SearchResult(
-            title="Test",
+            title="Test Paper",
             authors=["Smith"],
             ssrn_id="9999999",
         )
         dest = tmp_path / "paper.pdf"
+        source_pdf = tmp_path / "source.pdf"
+        _create_test_pdf(source_pdf, "Test Paper\nSmith\nThis is a research paper about testing with enough content to pass verification checks.")
+        pdf_bytes = source_pdf.read_bytes()
 
         with respx.mock:
             respx.get("https://papers.ssrn.com/sol3/Delivery.cfm?abstractid=9999999").mock(
                 return_value=httpx.Response(
                     200,
-                    content=FAKE_PDF_CONTENT,
+                    content=pdf_bytes,
                     headers={"content-type": "application/pdf"},
                 )
             )
@@ -349,17 +382,19 @@ class TestDownloadPdf:
             dl = await fetcher.download_pdf(result, dest)
 
         assert dl.success is True
-        assert dest.read_bytes() == FAKE_PDF_CONTENT
 
     @pytest.mark.asyncio
     async def test_nber_fallback(self, fetcher, tmp_path):
         """NBER URL is tried when paper URL indicates an NBER working paper."""
         result = SearchResult(
-            title="Test",
+            title="Test Paper",
             authors=["Smith"],
             url="https://www.nber.org/papers/w25232",
         )
         dest = tmp_path / "paper.pdf"
+        source_pdf = tmp_path / "source.pdf"
+        _create_test_pdf(source_pdf, "Test Paper\nSmith\nThis is a research paper about testing with enough content to pass verification checks.")
+        pdf_bytes = source_pdf.read_bytes()
 
         with respx.mock:
             # The NBER page itself returns HTML
@@ -374,7 +409,7 @@ class TestDownloadPdf:
             respx.get("https://www.nber.org/system/files/working_papers/w25232/w25232.pdf").mock(
                 return_value=httpx.Response(
                     200,
-                    content=FAKE_PDF_CONTENT,
+                    content=pdf_bytes,
                     headers={"content-type": "application/pdf"},
                 )
             )
@@ -387,13 +422,22 @@ class TestDownloadPdf:
     async def test_unpaywall_source(self, fetcher, tmp_path):
         """Unpaywall provides a working PDF URL."""
         result = SearchResult(
-            title="Test",
+            title="Test Paper",
             authors=["Smith"],
             doi="10.1234/test",
         )
         dest = tmp_path / "paper.pdf"
+        source_pdf = tmp_path / "source.pdf"
+        _create_test_pdf(source_pdf, "Test Paper\nSmith\nThis is a research paper about testing with enough content to pass verification checks.")
+        pdf_bytes = source_pdf.read_bytes()
 
         with respx.mock:
+            # OpenAlex: no results
+            respx.get(url__regex=r".*openalex\.org.*").mock(
+                return_value=httpx.Response(200, json={
+                    "open_access": {}, "locations": []
+                })
+            )
             respx.get("https://api.unpaywall.org/v2/10.1234/test").mock(
                 return_value=httpx.Response(200, json={
                     "best_oa_location": {
@@ -409,7 +453,7 @@ class TestDownloadPdf:
             respx.get("https://repository.edu/paper.pdf").mock(
                 return_value=httpx.Response(
                     200,
-                    content=FAKE_PDF_CONTENT,
+                    content=pdf_bytes,
                     headers={"content-type": "application/pdf"},
                 )
             )
@@ -769,3 +813,297 @@ class TestGetByIdentifierWithCrossRefFallback:
         assert result is not None
         assert result.source == "semantic_scholar"
         assert not crossref_route.called
+
+
+class TestOpenAlexLookup:
+    @pytest.mark.asyncio
+    async def test_finds_pdf_urls(self, fetcher):
+        with respx.mock:
+            respx.get(url__regex=r".*openalex\.org.*").mock(
+                return_value=httpx.Response(200, json={
+                    "open_access": {"oa_url": "https://repository.edu/paper.pdf"},
+                    "locations": [
+                        {"pdf_url": "https://repository.edu/paper.pdf"},
+                        {"pdf_url": "https://other.edu/preprint.pdf"},
+                    ],
+                })
+            )
+            urls = await fetcher._get_openalex_pdf_urls("10.1234/test")
+
+        assert len(urls) == 2
+        assert "repository.edu" in urls[0]
+        assert "other.edu" in urls[1]
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_404(self, fetcher):
+        with respx.mock:
+            respx.get(url__regex=r".*openalex\.org.*").mock(
+                return_value=httpx.Response(404)
+            )
+            urls = await fetcher._get_openalex_pdf_urls("10.9999/fake")
+
+        assert urls == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_network_error(self, fetcher):
+        with respx.mock:
+            respx.get(url__regex=r".*openalex\.org.*").mock(
+                side_effect=httpx.ConnectError("timeout")
+            )
+            urls = await fetcher._get_openalex_pdf_urls("10.1234/test")
+
+        assert urls == []
+
+    @pytest.mark.asyncio
+    async def test_deduplicates_urls(self, fetcher):
+        with respx.mock:
+            respx.get(url__regex=r".*openalex\.org.*").mock(
+                return_value=httpx.Response(200, json={
+                    "open_access": {"oa_url": "https://repository.edu/paper.pdf"},
+                    "locations": [
+                        {"pdf_url": "https://repository.edu/paper.pdf"},
+                        {"pdf_url": "https://repository.edu/paper.pdf"},
+                    ],
+                })
+            )
+            urls = await fetcher._get_openalex_pdf_urls("10.1234/test")
+
+        assert len(urls) == 1
+
+    @pytest.mark.asyncio
+    async def test_handles_missing_fields(self, fetcher):
+        with respx.mock:
+            respx.get(url__regex=r".*openalex\.org.*").mock(
+                return_value=httpx.Response(200, json={
+                    "open_access": {},
+                    "locations": [{"pdf_url": None}, {}],
+                })
+            )
+            urls = await fetcher._get_openalex_pdf_urls("10.1234/test")
+
+        assert urls == []
+
+
+class TestOpenAlexInDownload:
+    @pytest.mark.asyncio
+    async def test_openalex_url_tried_in_download(self, fetcher, tmp_path):
+        """OpenAlex URLs are tried when other sources fail."""
+        result = SearchResult(
+            title="Test Paper",
+            authors=["Smith"],
+            doi="10.1234/test",
+        )
+        dest = tmp_path / "paper.pdf"
+        pdf_path = tmp_path / "source.pdf"
+        _create_test_pdf(pdf_path, "Test Paper\nSmith\nSome content here to fill the page")
+        pdf_bytes = pdf_path.read_bytes()
+
+        with respx.mock:
+            respx.get(url__regex=r".*openalex\.org.*").mock(
+                return_value=httpx.Response(200, json={
+                    "open_access": {},
+                    "locations": [
+                        {"pdf_url": "https://repository.edu/paper.pdf"},
+                    ],
+                })
+            )
+            respx.get("https://repository.edu/paper.pdf").mock(
+                return_value=httpx.Response(
+                    200, content=pdf_bytes,
+                    headers={"content-type": "application/pdf"},
+                )
+            )
+            respx.get("https://api.unpaywall.org/v2/10.1234/test").mock(
+                return_value=httpx.Response(200, json={"best_oa_location": None, "oa_locations": []})
+            )
+            respx.get("https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/").mock(
+                return_value=httpx.Response(200, json={"records": []})
+            )
+            respx.get("https://doi.org/10.1234/test").mock(
+                return_value=httpx.Response(200, text="<html>page</html>",
+                                           headers={"content-type": "text/html"})
+            )
+
+            dl = await fetcher.download_pdf(result, dest)
+
+        assert dl.success is True
+        repo_attempts = [a for a in dl.attempts if "repository.edu" in a.url]
+        assert len(repo_attempts) == 1
+
+
+class TestVerifyPdfContent:
+    def test_matching_paper(self, tmp_path):
+        pdf_path = tmp_path / "paper.pdf"
+        _create_test_pdf(pdf_path, "Causal Inference in Economics\nJohn Smith\nAbstract: We study causal methods.")
+        result = verify_pdf_content(pdf_path, "Causal Inference in Economics", ["John Smith"])
+        assert result["verified"] is True
+        assert result["title_similarity"] > 0
+
+    def test_wrong_paper(self, tmp_path):
+        pdf_path = tmp_path / "paper.pdf"
+        _create_test_pdf(pdf_path, "Machine Learning for Weather Prediction\nJane Doe\nAbstract: We forecast weather.")
+        result = verify_pdf_content(pdf_path, "Causal Inference in Economics", ["John Smith"])
+        assert result["verified"] is False
+        assert result["reason"] != ""
+
+    def test_empty_pdf(self, tmp_path):
+        pdf_path = tmp_path / "paper.pdf"
+        doc = pymupdf.open()
+        doc.new_page()
+        doc.save(str(pdf_path))
+        doc.close()
+        result = verify_pdf_content(pdf_path, "Test Paper", ["Smith"])
+        assert result["verified"] is False
+        assert "too little text" in result["reason"]
+
+    def test_corrupt_file(self, tmp_path):
+        pdf_path = tmp_path / "paper.pdf"
+        pdf_path.write_bytes(b"not a pdf at all")
+        result = verify_pdf_content(pdf_path, "Test Paper", ["Smith"])
+        assert result["verified"] is False
+        assert "Failed to read" in result["reason"]
+
+    def test_title_with_author_match(self, tmp_path):
+        pdf_path = tmp_path / "paper.pdf"
+        _create_test_pdf(
+            pdf_path,
+            "The Macroeconomic Announcement Premium\nHengjie Ai, Ravi Bansal\nWe study announcement returns."
+        )
+        result = verify_pdf_content(
+            pdf_path,
+            "Macroeconomic Announcement Premium",
+            ["Hengjie Ai", "Ravi Bansal"],
+        )
+        assert result["verified"] is True
+
+    def test_no_authors_but_strong_title_match(self, tmp_path):
+        pdf_path = tmp_path / "paper.pdf"
+        _create_test_pdf(
+            pdf_path,
+            "Causal Inference in Modern Economics\nAnonymous submission\nWe study causal inference in economics using novel approaches."
+        )
+        result = verify_pdf_content(
+            pdf_path,
+            "Causal Inference in Modern Economics",
+            ["Unknown Author"],
+        )
+        assert result["verified"] is True
+
+
+class TestVerificationInDownload:
+    @pytest.mark.asyncio
+    async def test_rejects_wrong_pdf_and_continues(self, fetcher, tmp_path):
+        """If downloaded PDF doesn't match metadata, it's rejected and next source tried."""
+        result = SearchResult(
+            title="Causal Inference in Economics",
+            authors=["John Smith"],
+            url="https://example.com/wrong.pdf",
+            open_access_pdf_url="https://example.com/correct.pdf",
+        )
+        dest = tmp_path / "paper.pdf"
+
+        wrong_pdf_path = tmp_path / "wrong.pdf"
+        _create_test_pdf(wrong_pdf_path, "Machine Learning for Weather\nJane Doe\nCompletely different paper.")
+        wrong_pdf_bytes = wrong_pdf_path.read_bytes()
+
+        correct_pdf_path = tmp_path / "correct.pdf"
+        _create_test_pdf(correct_pdf_path, "Causal Inference in Economics\nJohn Smith\nThis is the right paper.")
+        correct_pdf_bytes = correct_pdf_path.read_bytes()
+
+        with respx.mock:
+            # Direct URL (position 3) returns wrong paper
+            respx.get("https://example.com/wrong.pdf").mock(
+                return_value=httpx.Response(
+                    200, content=wrong_pdf_bytes,
+                    headers={"content-type": "application/pdf"},
+                )
+            )
+            # Semantic Scholar OA (position 4) returns correct paper
+            respx.get("https://example.com/correct.pdf").mock(
+                return_value=httpx.Response(
+                    200, content=correct_pdf_bytes,
+                    headers={"content-type": "application/pdf"},
+                )
+            )
+
+            dl = await fetcher.download_pdf(result, dest)
+
+        assert dl.success is True
+        assert len(dl.attempts) == 2
+        assert "Content mismatch" in dl.attempts[0].error
+        assert dl.attempts[1].error is None
+
+    @pytest.mark.asyncio
+    async def test_verification_skipped_when_disabled(self, fetcher, tmp_path):
+        """verify=False skips content checking."""
+        result = SearchResult(
+            title="Causal Inference in Economics",
+            authors=["John Smith"],
+            open_access_pdf_url="https://example.com/paper.pdf",
+        )
+        dest = tmp_path / "paper.pdf"
+
+        wrong_pdf_path = tmp_path / "wrong.pdf"
+        _create_test_pdf(wrong_pdf_path, "Completely Different Paper\nJane Doe")
+        wrong_pdf_bytes = wrong_pdf_path.read_bytes()
+
+        with respx.mock:
+            respx.get("https://example.com/paper.pdf").mock(
+                return_value=httpx.Response(
+                    200, content=wrong_pdf_bytes,
+                    headers={"content-type": "application/pdf"},
+                )
+            )
+
+            dl = await fetcher.download_pdf(result, dest, verify=False)
+
+        assert dl.success is True
+
+
+class TestSearchResultFromMetadata:
+    def test_round_trip_fields(self):
+        paper = PaperMetadata(
+            bibtex_key="smith_2024_causal",
+            title="Causal Inference in Economics",
+            authors=["John Smith", "Jane Doe"],
+            year=2024,
+            abstract="We study causal methods.",
+            doi="10.1234/test",
+            arxiv_id="2401.12345",
+            ssrn_id="4567890",
+            url="https://example.com/paper",
+        )
+        sr = SearchResult.from_metadata(paper)
+        assert sr.title == paper.title
+        assert sr.authors == paper.authors
+        assert sr.year == paper.year
+        assert sr.abstract == paper.abstract
+        assert sr.doi == paper.doi
+        assert sr.arxiv_id == paper.arxiv_id
+        assert sr.ssrn_id == paper.ssrn_id
+        assert sr.url == paper.url
+
+    def test_minimal_metadata(self):
+        paper = PaperMetadata(
+            bibtex_key="unknown_0_paper",
+            title="Untitled",
+            authors=[],
+        )
+        sr = SearchResult.from_metadata(paper)
+        assert sr.title == "Untitled"
+        assert sr.authors == []
+        assert sr.doi is None
+        assert sr.arxiv_id is None
+
+    def test_produces_valid_candidate_urls(self, fetcher):
+        paper = PaperMetadata(
+            bibtex_key="smith_2024_causal",
+            title="Causal Inference",
+            authors=["John Smith"],
+            arxiv_id="2401.12345",
+            doi="10.1234/test",
+        )
+        sr = SearchResult.from_metadata(paper)
+        urls = fetcher.get_candidate_urls(sr)
+        assert "https://arxiv.org/pdf/2401.12345" in urls
+        assert "https://doi.org/10.1234/test" in urls

@@ -76,5 +76,7 @@ Once all subagents return, synthesize their findings into a coherent review:
 ## Step 4: Suggest next steps
 
 - Are there important papers missing from the library that would strengthen
-  the review? If so, suggest specific papers or searches.
+  the review? If so, suggest specific papers or searches. Note: `ingest_paper`
+  only saves metadata — to also get the PDF, call `download_paper` with the
+  bibtex key after ingesting.
 - Are there follow-up questions the user might want to explore?
