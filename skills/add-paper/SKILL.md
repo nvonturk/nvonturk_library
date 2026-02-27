@@ -23,10 +23,19 @@ If the argument looks like a DOI (contains "10."), arXiv ID (like "2301.12345"),
 SSRN URL/ID, or other URL, call `ingest_paper` directly with that identifier.
 
 If the argument is a title or description, first call `find_paper` to search for it.
-Pick the best match and call `ingest_paper` with its DOI or arXiv ID.
+Pick the best match. Before ingesting, compare the match against what the user asked for:
+- Do the authors match (if the user specified authors)?
+- Is the title a close match (if the user specified a title)?
+- Is the year correct (if the user specified a year)?
+
+If any of these seem off — e.g., different authors, substantially different title,
+wrong year — show the user what you found and ask them to confirm before proceeding.
+If the match looks correct, call `ingest_paper` with its DOI or arXiv ID.
 
 If `find_paper` returns no results, use web search to find the paper, then try
-`ingest_paper` with a DOI or URL from the search results.
+`ingest_paper` with a DOI or URL from the search results. Apply the same confirmation
+check: if the web search result doesn't closely match what the user asked for, confirm
+before ingesting.
 
 ## Step 2: Download PDF and fetch BibTeX
 
