@@ -10,6 +10,15 @@ You are adding a paper to the papertrail library. The user provided: $ARGUMENTS
 
 Follow these steps in order.
 
+## Step 0: Detect batch input
+
+If the argument contains multiple numbered citations (e.g., "1. Author (Year)..." or
+"1. Author, Title, Journal, Year" with 2+ entries), OR is a path to a `.md` file
+containing such a list, this is a **batch import**. Follow the **Batch Flow** section
+below instead of Steps 1-7.
+
+Otherwise, continue to Step 1 (single paper flow).
+
 ## Step 1: Find and ingest metadata
 
 If the argument is a **local file path** (ends in .pdf, or starts with / or ~/):
@@ -179,3 +188,70 @@ Provide a brief report to the user:
 - Main contribution (1-2 sentences)
 - Tags assigned
 - Confirmation that the paper is ready in the library
+
+---
+
+## Batch Flow
+
+This flow handles multiple citations at once. It ingests metadata and downloads PDFs
+but **skips summarization and tagging** (too expensive per paper — user can summarize
+individually later via `/read-paper`).
+
+### Phase 1: Parse citations
+
+If the input is a `.md` file path, read it first.
+
+Extract structured info from each numbered citation. For each entry, extract:
+- **Title**
+- **Authors**
+- **Year**
+- **Identifier** (DOI, SSRN URL/ID, arXiv ID) if embedded in the citation
+
+### Phase 2: Confirm with user
+
+Show the user:
+- Total number of citations parsed
+- 3-5 sample titles from the list
+- A note that summarization will be skipped (can be done later per paper)
+
+Ask them to confirm before proceeding. This catches cases where the input is
+malformed or not what the user intended.
+
+### Phase 3: Ingest in batches
+
+Process papers in **batches of 5** (to respect Semantic Scholar rate limits).
+
+For each paper in the batch:
+- If it has a DOI, SSRN ID, or arXiv ID → call `ingest_paper` directly
+- Otherwise → call `find_paper` with the title. Apply the same match-confirmation
+  logic as single-paper mode: check authors, title, and year. If the best match
+  seems off, **skip the paper** (don't prompt for each one — log it as "skipped"
+  with the reason). If the match looks correct, call `ingest_paper`.
+
+After each batch of ingestions completes, launch **in parallel** for all successfully
+ingested papers in that batch:
+- `download_paper` with the bibtex key (automated download)
+- `fetch_bibtex` with the bibtex key
+
+Track each paper's status: **ingested**, **failed** (with reason), or **skipped**
+(match looked wrong).
+
+Report progress to the user after each batch (e.g., "Batch 2/5 done: 4 ingested,
+1 skipped").
+
+### Phase 4: Report
+
+Provide a summary table of all papers:
+
+| # | Title | BibTeX Key | Status | PDF | BibTeX |
+|---|-------|------------|--------|-----|--------|
+
+Where:
+- **Status**: ingested / failed / skipped (with reason for failures and skips)
+- **PDF**: found / not found
+- **BibTeX**: fetched / not found
+
+End with a note:
+- Summarization was skipped for all papers
+- Suggest running `/read-paper` for individual papers they want to summarize
+- List any papers that need manual PDF downloads
